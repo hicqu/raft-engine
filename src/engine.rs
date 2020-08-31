@@ -1,4 +1,5 @@
 use std::io::BufRead;
+use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock, RwLockWriteGuard};
 use std::time::{Duration, Instant};
@@ -93,6 +94,54 @@ impl MemTableAccessor {
         }
         memtables
     }
+
+    pub fn lock_memtables(
+        &self,
+        raft_group_ids: impl IntoIterator<Item = u64>,
+    ) -> HashMap<u64, LockedMemTable> {
+        let mut tables = HashMap::default();
+        for raft_group_id in raft_group_ids {
+            if tables.contains_key(&raft_group_id) {
+                continue;
+            }
+            let table = LockedMemTable::new(self.get_or_insert(raft_group_id));
+            tables.insert(raft_group_id, table);
+        }
+        tables
+    }
+}
+
+#[cfg(test)]
+impl Default for MemTableAccessor {
+    fn default() -> MemTableAccessor {
+        let cfg = Config::default();
+        let stats: Arc<SharedCacheStats> = Default::default();
+        Self::new(Arc::new(move |id: u64| {
+            MemTable::new(id, cfg.cache_limit.0 as usize, stats.clone())
+        }))
+    }
+}
+
+pub struct LockedMemTable {
+    table: ManuallyDrop<Arc<RwLock<MemTable>>>,
+    guard: ManuallyDrop<RwLockWriteGuard<'static, MemTable>>,
+}
+
+impl LockedMemTable {
+    fn new(table: Arc<RwLock<MemTable>>) -> Self {
+        let guard = ManuallyDrop::new(unsafe { std::mem::transmute(table.wl()) });
+        let table = ManuallyDrop::new(table);
+        LockedMemTable { table, guard }
+    }
+}
+
+impl Drop for LockedMemTable {
+    fn drop(&mut self) {
+        unsafe {
+            ManuallyDrop::drop(&mut self.guard);
+            ManuallyDrop::drop(&mut self.table);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -154,11 +203,9 @@ impl FileEngine {
                 match LogBatch::from_bytes(&mut buf, current_read_file, offset) {
                     Ok(Some(log_batch)) => {
                         let entries_size = log_batch.entries_size();
-                        if let Some(tracker) = pipe_log.cache_submitor().get_cache_tracker(
-                            current_read_file,
-                            offset,
-                            entries_size,
-                        ) {
+                        if let Some(tracker) = pipe_log.cache_submitor(|c| {
+                            c.get_cache_tracker(current_read_file, offset, entries_size)
+                        }) {
                             for item in &log_batch.items {
                                 if let LogItemContent::Entries(ref entries) = item.content {
                                     entries.attach_cache_tracker(tracker.clone());
@@ -336,39 +383,19 @@ impl FileEngine {
     // Maybe we can improve the implement of "inactive log rewrite" and
     // forbid concurrent `append` to remove locks here.
     fn write(&self, log_batch: LogBatch, sync: bool) -> Result<usize> {
-        let mut rafts = Vec::with_capacity(log_batch.items.len());
-        for raft in log_batch.items.iter().map(|item| item.raft_group_id) {
-            rafts.push(raft);
-        }
-        rafts.sort();
-        rafts.dedup();
-
-        let mut memtables = Vec::with_capacity(rafts.len());
-        let mut locked = Vec::with_capacity(rafts.len());
-        for raft in &rafts {
-            memtables.push(self.memtables.get_or_insert(*raft));
-            let x = memtables.last_mut().unwrap().wl();
-            unsafe {
-                // Unsafe block because `locked` has mutable references to `memtables`.
-                let x: RwLockWriteGuard<'static, MemTable> = std::mem::transmute(x);
-                locked.push(x);
-            }
-        }
-
         let mut file_num = 0;
-        let bytes = self.pipe_log.write(&log_batch, sync, &mut file_num)?;
+        let (bytes, mut tables) = self.pipe_log.write(&log_batch, sync, &mut file_num)?;
         if file_num > 0 {
             for item in log_batch.items {
-                let offset = rafts.binary_search(&item.raft_group_id).unwrap();
-                let m = &mut locked[offset];
+                let m = &mut tables.get_mut(&item.raft_group_id).unwrap().guard;
                 Self::apply_log_item_to_memtable(item.content, &mut *m, file_num);
             }
         }
-        for memtable in locked {
-            if memtable.uninitialized() {
-                self.memtables.remove(memtable.region_id());
-            }
-        }
+        // for memtable in locked {
+        //     if memtable.uninitialized() {
+        //         self.memtables.remove(memtable.region_id());
+        //     }
+        // }
         Ok(bytes)
     }
 
@@ -387,7 +414,7 @@ impl FileEngine {
         }
 
         let mut file_num = 0;
-        self.pipe_log.write(&log_batch, false, &mut file_num)?;
+        self.pipe_log.write(&log_batch, false, &mut file_num, false)?;
         if file_num > 0 {
             for item in log_batch.items {
                 Self::apply_log_item_to_memtable(item.content, &mut *m, file_num);
@@ -563,26 +590,28 @@ impl FileEngine {
         let cache_limit = cfg.cache_limit.0 as usize;
         let cache_stats = Arc::new(SharedCacheStats::default());
 
-        let mut cache_evict_worker = Worker::new("cache_evict".to_owned(), None);
-
-        let mut pipe_log = PipeLog::open(
-            &cfg,
-            CacheSubmitor::new(
-                cache_limit,
-                chunk_limit,
-                cache_evict_worker.scheduler(),
-                cache_stats.clone(),
-            ),
-        )
-        .expect("Open raft log");
-        pipe_log.cache_submitor().block_on_full();
-
         let memtables = {
             let stats = cache_stats.clone();
             MemTableAccessor::new(Arc::new(move |id: u64| {
                 MemTable::new(id, cache_limit, stats.clone())
             }))
         };
+
+        let mut cache_evict_worker = Worker::new("cache_evict".to_owned(), None);
+        let cache_scheduler = cache_evict_worker.scheduler();
+
+        let mut pipe_log = PipeLog::open(
+            &cfg,
+            memtables.clone(),
+            CacheSubmitor::new(
+                cache_limit,
+                chunk_limit,
+                cache_scheduler,
+                cache_stats.clone(),
+            ),
+        )
+        .expect("Open raft log");
+        pipe_log.cache_submitor(CacheSubmitor::block_on_full);
 
         let cache_evict_runner = CacheEvictRunner::new(
             cache_limit,
@@ -595,7 +624,7 @@ impl FileEngine {
 
         let recovery_mode = cfg.recovery_mode;
         FileEngine::recover(&mut pipe_log, &memtables, recovery_mode).unwrap();
-        pipe_log.cache_submitor().nonblock_on_full();
+        pipe_log.cache_submitor(CacheSubmitor::nonblock_on_full);
 
         FileEngine {
             cfg: Arc::new(cfg),

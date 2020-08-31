@@ -3,14 +3,15 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::{cmp, u64};
 
 use crate::cache_evict::CacheSubmitor;
 use crate::config::Config;
+use crate::engine::{LockedMemTable, MemTableAccessor};
 use crate::log_batch::{LogBatch, LogItemContent};
 use crate::metrics::*;
-use crate::util::HandyRwLock;
+use crate::util::{HandyRwLock, HashMap};
 use crate::{Error, Result};
 
 use nix::fcntl;
@@ -55,6 +56,13 @@ impl LogManager {
     }
 }
 
+struct MonoContext {
+    // Submit a cache request to global entry cache.
+    cache_submitor: CacheSubmitor,
+    // Lock all memtables involved in an `write`.
+    memtables: MemTableAccessor,
+}
+
 #[derive(Clone)]
 pub struct PipeLog {
     dir: String,
@@ -62,25 +70,32 @@ pub struct PipeLog {
     bytes_per_sync: usize,
 
     log_manager: Arc<RwLock<LogManager>>,
-    cache_submitor: Arc<Mutex<CacheSubmitor>>,
+    mono_context: Arc<Mutex<MonoContext>>,
 
     // Used when recovering from disk.
     current_read_file_num: u64,
 }
 
 impl PipeLog {
-    fn new(cfg: &Config, cache_submitor: CacheSubmitor) -> PipeLog {
+    fn new(cfg: &Config, memtables: MemTableAccessor, cache_submitor: CacheSubmitor) -> PipeLog {
         PipeLog {
             dir: cfg.dir.clone(),
             rotate_size: cfg.target_file_size.0 as usize,
             bytes_per_sync: cfg.bytes_per_sync.0 as usize,
             log_manager: Arc::new(RwLock::new(LogManager::new())),
-            cache_submitor: Arc::new(Mutex::new(cache_submitor)),
+            mono_context: Arc::new(Mutex::new(MonoContext {
+                cache_submitor,
+                memtables,
+            })),
             current_read_file_num: 0,
         }
     }
 
-    pub fn open(cfg: &Config, cache_submitor: CacheSubmitor) -> Result<PipeLog> {
+    pub fn open(
+        cfg: &Config,
+        memtables: MemTableAccessor,
+        cache_submitor: CacheSubmitor,
+    ) -> Result<PipeLog> {
         let path = Path::new(&cfg.dir);
         if !path.exists() {
             info!("Create raft log directory: {}", &cfg.dir);
@@ -119,7 +134,7 @@ impl PipeLog {
         }
 
         // Initialize.
-        let mut pipe_log = PipeLog::new(cfg, cache_submitor);
+        let mut pipe_log = PipeLog::new(cfg, memtables, cache_submitor);
         if log_files.is_empty() {
             {
                 let mut manager = pipe_log.log_manager.wl();
@@ -204,7 +219,7 @@ impl PipeLog {
     }
 
     pub fn close(&self) -> Result<()> {
-        let _write_lock = self.cache_submitor.lock().unwrap();
+        let _write_lock = self.mono_context.lock().unwrap();
 
         let active_log_size = self.log_manager.rl().active_log_size;
         self.truncate_active_log(active_log_size)?;
@@ -341,29 +356,45 @@ impl PipeLog {
         Ok(())
     }
 
-    pub fn write(&self, batch: &LogBatch, sync: bool, file_num: &mut u64) -> Result<usize> {
-        if let Some(content) = batch.encode_to_bytes() {
-            let bytes = content.len();
+    pub fn write(
+        &self,
+        batch: &LogBatch,
+        sync: bool,
+        lock_memtables: bool,
+        file_num: &mut u64,
+    ) -> Result<(usize, HashMap<u64, LockedMemTable>)> {
+        let (content_len, content) = match batch.encode_to_bytes() {
+            Some(bytes) => (bytes.len(), bytes),
+            None => return Ok((0, HashMap::default())),
+        };
 
-            let mut cache_submitor = self.cache_submitor.lock().unwrap();
-            let (cur_file_num, offset) = self.append(&content, sync)?;
-            let entries_size = batch.entries_size();
-            let tracker = cache_submitor.get_cache_tracker(cur_file_num, offset, entries_size);
-            drop(cache_submitor);
+        let mut ctx = self.mono_context.lock().unwrap();
+        // TODO: Use async I/O if it's available.
+        let (cur_file_num, offset) = self.append(&content, sync)?;
 
-            if let Some(tracker) = tracker {
-                for item in &batch.items {
-                    if let LogItemContent::Entries(ref entries) = item.content {
-                        entries.update_offset_when_needed(cur_file_num, offset);
-                        entries.attach_cache_tracker(tracker.clone());
-                    }
+        let entries_size = batch.entries_size();
+        let tracker = ctx
+            .cache_submitor
+            .get_cache_tracker(cur_file_num, offset, entries_size);
+
+        let locked_memtables = if lock_memtables {ctx
+            .memtables
+                .lock_memtables(batch.items.iter().map(|i| i.raft_group_id))} else {
+            HashMap::default()
+                };
+        drop(ctx);
+
+        if let Some(tracker) = tracker {
+            for item in &batch.items {
+                if let LogItemContent::Entries(ref entries) = item.content {
+                    entries.update_offset_when_needed(cur_file_num, offset);
+                    entries.attach_cache_tracker(tracker.clone());
                 }
             }
-
-            *file_num = cur_file_num;
-            return Ok(bytes);
         }
-        Ok(0)
+
+        *file_num = cur_file_num;
+        Ok((content_len, locked_memtables))
     }
 
     pub fn purge_to(&self, file_num: u64) -> Result<usize> {
@@ -519,8 +550,9 @@ impl PipeLog {
         offset as u64
     }
 
-    pub fn cache_submitor(&self) -> MutexGuard<CacheSubmitor> {
-        self.cache_submitor.lock().unwrap()
+    pub fn cache_submitor<F: FnMut(&mut CacheSubmitor) -> R, R>(&self, mut f: F) -> R {
+        let mut ctx = self.mono_context.lock().unwrap();
+        f(&mut ctx.cache_submitor)
     }
 }
 
@@ -572,7 +604,7 @@ mod tests {
         let mut worker = Worker::new("test".to_owned(), None);
         let stats = Arc::new(SharedCacheStats::default());
         let submitor = CacheSubmitor::new(usize::MAX, 4096, worker.scheduler(), stats);
-        let log = PipeLog::open(&cfg, submitor).unwrap();
+        let log = PipeLog::open(&cfg, MemTableAccessor::default(), submitor).unwrap();
         (log, worker.take_receiver())
     }
 
